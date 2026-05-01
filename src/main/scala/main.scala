@@ -140,21 +140,35 @@ object Master {
 
               active(newState)
             case WorkDone(idx, res, worker) =>
-              timers.cancel(retryKey(idx))
-              val newState = oldState.copy(
-                partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
-                partitionsDone = oldState.partitionsDone + 1
-              )
+              val maybeNewState = oldState.partitionStates(idx) match {
+                case PartitionState.Processing(w, _) if w == worker =>
+                  timers.cancel(retryKey(idx))
+                  Some(oldState.copy(
+                    partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
+                    partitionsDone = oldState.partitionsDone + 1
+                  ))
+                case PartitionState.Dispatched(w, _) if w == worker =>
+                  timers.cancel(retryKey(idx))
+                  Some(oldState.copy(
+                    partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
+                    partitionsDone = oldState.partitionsDone + 1
+                  ))
+                case _ =>
+                  None
+              }
 
-              if (newState.partitionsDone == partitions.size) {
-                // All work done: Reconstitute in order
-                val allParts = newState.partitionStates.asInstanceOf[Vector[PartitionState.Done]]
-                val finalData = allParts.flatMap(_.result)
-                println(s"--- Processing Complete ---")
-                finalData.foreach(println)
-                Behaviors.stopped
-              } else {
-                active(newState.sendNextWork(worker))
+              maybeNewState match {
+                case Some(newState) if newState.partitionsDone == partitions.size =>
+                  // All work done: Reconstitute in order
+                  val allParts = newState.partitionStates.asInstanceOf[Vector[PartitionState.Done]]
+                  val finalData = allParts.flatMap(_.result)
+                  println(s"--- Processing Complete ---")
+                  finalData.foreach(println)
+                  Behaviors.stopped
+                case Some(newState) =>
+                  active(newState.sendNextWork(worker))
+                case None =>
+                  active(oldState)
               }
             case WorkerDied(worker) =>
               val interruptedPartitions = oldState.partitionStates.zipWithIndex.collect {
