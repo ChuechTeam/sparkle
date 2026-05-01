@@ -54,7 +54,7 @@ object Worker {
 
 enum PartitionState {
   case Waiting
-  case Dispatched(who: WorkerRef, since: Instant)
+  case Dispatched(who: WorkerRef, since: Instant, retryCount: Int)
   case Processing(who: WorkerRef, since: Instant)
   case Done(result: Vector[?])
 }
@@ -70,6 +70,7 @@ object Master {
     Behaviors.setup { context =>
       Behaviors.withTimers { timers =>
         val partitions = task.data.grouped(1024).toVector
+        val maxAckRetries = 3
         def retryKey(partitionIdx: Int): String = s"retry-work-$partitionIdx"
 
         extension (state: MasterState) {
@@ -99,6 +100,13 @@ object Master {
             )
           }
 
+          def replaceWorker(worker: WorkerRef): (MasterState, WorkerRef) = {
+            context.stop(worker)
+            state
+              .removeWorker(worker)
+              .spawnWorker()
+          }
+
           def sendWork(partitionIdx: Int, worker: WorkerRef): MasterState = {
             worker ! WorkBatch(partitionIdx, partitions(partitionIdx), task.stage, context.self)
             timers.startTimerWithFixedDelay(
@@ -109,7 +117,7 @@ object Master {
 
             state.copy(
               partitionStates = state.partitionStates.updated(partitionIdx,
-                PartitionState.Dispatched(worker, Instant.now()))
+                PartitionState.Dispatched(worker, Instant.now(), retryCount = 0))
             )
           }
 
@@ -130,7 +138,7 @@ object Master {
           Behaviors.receiveMessage {
             case WorkAccepted(idx, worker) =>
               val newState = oldState.partitionStates(idx) match {
-                case PartitionState.Dispatched(w, _) if w == worker =>
+                case PartitionState.Dispatched(w, _, _) if w == worker =>
                   timers.cancel(retryKey(idx))
                   oldState.copy(
                     partitionStates = oldState.partitionStates.updated(idx, Processing(worker, Instant.now()))
@@ -147,7 +155,7 @@ object Master {
                     partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
                     partitionsDone = oldState.partitionsDone + 1
                   ))
-                case PartitionState.Dispatched(w, _) if w == worker =>
+                case PartitionState.Dispatched(w, _, _) if w == worker =>
                   timers.cancel(retryKey(idx))
                   Some(oldState.copy(
                     partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
@@ -172,24 +180,45 @@ object Master {
               }
             case WorkerDied(worker) =>
               val interruptedPartitions = oldState.partitionStates.zipWithIndex.collect {
-                case (PartitionState.Dispatched(w, _), i) if w == worker => i
+                case (PartitionState.Dispatched(w, _, _), i) if w == worker => i
                 case (Processing(w, _), i) if w == worker => i
               }
 
-              val stateWithoutWorker = oldState.removeWorker(worker)
-              val (stateWithReplacement, replacement) = stateWithoutWorker.spawnWorker()
-              val reassignedState = interruptedPartitions.foldLeft(stateWithReplacement) { (state, partitionIdx) =>
-                state.sendWork(partitionIdx, replacement)
-              }
+              if (!oldState.workers.contains(worker)) {
+                active(oldState)
+              } else {
+                interruptedPartitions.foreach(idx => timers.cancel(retryKey(idx)))
+                val (stateWithReplacement, replacement) = oldState.replaceWorker(worker)
+                val reassignedState = interruptedPartitions.foldLeft(stateWithReplacement) { (state, partitionIdx) =>
+                  state.sendWork(partitionIdx, replacement)
+                }
 
-              active(reassignedState.sendNextWork(replacement))
+                active(reassignedState.sendNextWork(replacement))
+              }
             case RetrySendWork(idx) =>
               val newState = oldState.partitionStates(idx) match {
-                case PartitionState.Dispatched(worker, _) =>
-                  worker ! WorkBatch(idx, partitions(idx), task.stage, context.self)
-                  oldState.copy(
-                    partitionStates = oldState.partitionStates.updated(idx, PartitionState.Dispatched(worker, Instant.now()))
-                  )
+                case PartitionState.Dispatched(worker, _, retryCount) =>
+                  val nextRetryCount = retryCount + 1
+
+                  if (nextRetryCount <= maxAckRetries) {
+                    worker ! WorkBatch(idx, partitions(idx), task.stage, context.self)
+                    oldState.copy(
+                      partitionStates = oldState.partitionStates.updated(
+                        idx,
+                        PartitionState.Dispatched(worker, Instant.now(), nextRetryCount)
+                      )
+                    )
+                  } else {
+                    val workerPartitions = oldState.partitionStates.zipWithIndex.collect {
+                      case (PartitionState.Dispatched(w, _, _), i) if w == worker => i
+                      case (Processing(w, _), i) if w == worker => i
+                    }
+                    workerPartitions.foreach(i => timers.cancel(retryKey(i)))
+                    val (stateWithReplacement, replacement) = oldState.replaceWorker(worker)
+                    workerPartitions.foldLeft(stateWithReplacement) { (state, partitionIdx) =>
+                      state.sendWork(partitionIdx, replacement)
+                    }
+                  }
                 case _ =>
                   oldState
               }
