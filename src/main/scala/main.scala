@@ -35,9 +35,12 @@ type MasterRef = ActorRef[MasterMessage]
 val rng = Random()
 
 object Worker {
-  def apply(): Behavior[WorkerMessage] = Behaviors.receive { (ctx, msg) =>
+  def apply(enableCrashForTest: Boolean): Behavior[WorkerMessage] = Behaviors.receive { (ctx, msg) =>
     msg match {
       case WorkBatch(index, data, stage, master) =>
+        if (enableCrashForTest && ctx.self.path.name == "worker-1") {
+          throw RuntimeException(s"test1: simulated crash on ${ctx.self.path.name}")
+        }
         val processed = stage.actions.foldLeft(data) { (acc, action) => action.applyUnsafe(acc) }
         master ! WorkDone(index, processed, ctx.self)
         Behaviors.same
@@ -58,7 +61,7 @@ case class MasterState(partitionStates: Vector[PartitionState],
                        partitionsDone: Int)
 
 object Master {
-  def apply(task: Task): Behavior[MasterMessage] =
+  def apply(task: Task, enableCrashForTest: Boolean): Behavior[MasterMessage] =
     Behaviors.setup { context =>
       Behaviors.withTimers { timers =>
         val partitions = task.data.grouped(1024).toVector
@@ -66,7 +69,7 @@ object Master {
         extension (state: MasterState) {
           def spawnWorker(): (MasterState, WorkerRef) = {
             val spawned = context.spawn(
-              Behaviors.supervise(Worker()).onFailure(SupervisorStrategy.stop.withLoggingEnabled(true)),
+              Behaviors.supervise(Worker(enableCrashForTest)).onFailure(SupervisorStrategy.stop.withLoggingEnabled(true)),
               s"worker-${state.nextWorkerNumber}")
             context.watchWith(spawned, WorkerDied(spawned))
 
@@ -171,12 +174,18 @@ object Master {
 }
 
 @main
-def main(): Unit = {
+def main(args: String*): Unit = {
+  val mode = args.headOption.getOrElse("run")
+  val enableCrashForTest = mode == "test1"
+
   val rawData = (1 to 50000).toVector // Example data
   val actions = List(
     FilterAction[Int](_ < 100), // Logic: Keep numbers < 100
     MapAction[Int, String](x => "Nombre : " + x) // map stuff
   )
 
-  val system = ActorSystem(Master(Task(rawData, Stage(actions, Option.empty))), "ProcessingSystem")
+  val system = ActorSystem(
+    Master(Task(rawData, Stage(actions, Option.empty)), enableCrashForTest),
+    "ProcessingSystem"
+  )
 }
