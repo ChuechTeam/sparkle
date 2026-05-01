@@ -22,6 +22,7 @@ sealed trait MasterMessage
 
 case class WorkBatch(index: Int, data: Vector[?], stage: Stage, master: MasterRef) extends WorkerMessage
 
+case class WorkAccepted(index: Int, worker: WorkerRef) extends MasterMessage
 case class WorkDone(index: Int, result: Vector[?], worker: WorkerRef) extends MasterMessage
 
 case class WorkerDied(worker: WorkerRef) extends MasterMessage
@@ -41,6 +42,7 @@ object Worker {
         if (enableCrashForTest && ctx.self.path.name == "worker-1") {
           throw RuntimeException(s"test1: simulated crash on ${ctx.self.path.name}")
         }
+        master ! WorkAccepted(index, ctx.self)
         val processed = stage.actions.foldLeft(data) { (acc, action) => action.applyUnsafe(acc) }
         master ! WorkDone(index, processed, ctx.self)
         Behaviors.same
@@ -50,6 +52,7 @@ object Worker {
 
 enum PartitionState {
   case Waiting
+  case Dispatched(who: WorkerRef, since: Instant)
   case Processing(who: WorkerRef, since: Instant)
   case Done(result: Vector[?])
 }
@@ -98,7 +101,7 @@ object Master {
 
             state.copy(
               partitionStates = state.partitionStates.updated(partitionIdx,
-                Processing(worker, Instant.now()))
+                PartitionState.Dispatched(worker, Instant.now()))
             )
           }
 
@@ -113,21 +116,20 @@ object Master {
             }
           }
 
-          def replaceSlackerAndDoWork(slackerPartitionIdx: Int): MasterState = {
-            state.partitionStates(slackerPartitionIdx) match {
-              case Processing(slacker, _) =>
-                val (newState, worker) = state
-                  .removeWorker(slacker)
-                  .spawnWorker()
-
-                newState.sendWork(slackerPartitionIdx, worker)
-              case _ => state
-            }
-          }
         }
 
         def active(oldState: MasterState): Behavior[MasterMessage] =
           Behaviors.receiveMessage {
+            case WorkAccepted(idx, worker) =>
+              val newState = oldState.partitionStates(idx) match {
+                case PartitionState.Dispatched(w, _) if w == worker =>
+                  oldState.copy(
+                    partitionStates = oldState.partitionStates.updated(idx, Processing(worker, Instant.now()))
+                  )
+                case _ => oldState
+              }
+
+              active(newState)
             case WorkDone(idx, res, worker) =>
               val newState = oldState.copy(
                 partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
@@ -146,6 +148,7 @@ object Master {
               }
             case WorkerDied(worker) =>
               val interruptedPartitions = oldState.partitionStates.zipWithIndex.collect {
+                case (PartitionState.Dispatched(w, _), i) if w == worker => i
                 case (Processing(w, _), i) if w == worker => i
               }
 
