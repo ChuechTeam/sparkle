@@ -3,8 +3,6 @@ import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.apache.pekko.actor.typed.{ActorRef, ActorSystem, Behavior, SupervisorStrategy}
 
 import java.time.Instant
-import java.util.concurrent.TimeUnit
-import scala.concurrent.duration.FiniteDuration
 import scala.util.Random
 import scala.util.chaining.scalaUtilChainingOps
 
@@ -26,7 +24,7 @@ case class WorkBatch(index: Int, data: Vector[?], stage: Stage, master: MasterRe
 
 case class WorkDone(index: Int, result: Vector[?], worker: WorkerRef) extends MasterMessage
 
-object KillSlackers extends MasterMessage
+case class WorkerDied(worker: WorkerRef) extends MasterMessage
 
 // not sure
 //case class WorkFailed(errorMessage: String, worker: ActorRef[WorkBatch[?]])
@@ -70,6 +68,7 @@ object Master {
             val spawned = context.spawn(
               Behaviors.supervise(Worker()).onFailure(SupervisorStrategy.stop.withLoggingEnabled(true)),
               s"worker-${state.nextWorkerNumber}")
+            context.watchWith(spawned, WorkerDied(spawned))
 
             (state.copy(
               workers = state.workers + spawned,
@@ -86,8 +85,6 @@ object Master {
           }
 
           def removeWorker(worker: WorkerRef): MasterState = {
-            context.stop(worker)
-
             state.copy(
               workers = state.workers - worker
             )
@@ -144,21 +141,19 @@ object Master {
               } else {
                 active(newState.sendNextWork(worker))
               }
-            case KillSlackers =>
-              val now = Instant.now()
-              val slackers = oldState.partitionStates.zipWithIndex.collect {
-                case (Processing(_, since), i) if now.isAfter(since.plusSeconds(30)) => i
+            case WorkerDied(worker) =>
+              val interruptedPartitions = oldState.partitionStates.zipWithIndex.collect {
+                case (Processing(w, _), i) if w == worker => i
               }
 
-              if (slackers.nonEmpty) {
-                println("Slackers found, let's destroy them! " + slackers)
+              val stateWithoutWorker = oldState.removeWorker(worker)
+              val (stateWithReplacement, replacement) = stateWithoutWorker.spawnWorker()
+              val reassignedState = interruptedPartitions.foldLeft(stateWithReplacement) { (state, partitionIdx) =>
+                state.sendWork(partitionIdx, replacement)
               }
 
-              val newState = slackers.foldLeft(oldState)((state, slacker) => state.replaceSlackerAndDoWork(slacker))
-              active(newState)
+              active(reassignedState.sendNextWork(replacement))
           }
-
-        timers.startTimerAtFixedRate(KillSlackers, FiniteDuration(1, TimeUnit.SECONDS))
 
         val state = MasterState(
           partitionStates = partitions.map(_ => PartitionState.Waiting),
