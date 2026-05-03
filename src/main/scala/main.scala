@@ -41,11 +41,14 @@ object Worker {
   def apply(enableCrashForTest: Boolean): Behavior[WorkerMessage] = Behaviors.receive { (ctx, msg) =>
     msg match {
       case WorkBatch(index, data, stage, master) =>
+        println(s"[WORKER] ${ctx.self.path.name} Received partition $index")
         if (enableCrashForTest && ctx.self.path.name == "worker-1") {
+          println(s"[WORKER] ${ctx.self.path.name} CRASHING INTENTIONALLY !")
           throw RuntimeException(s"test1: simulated crash on ${ctx.self.path.name}")
         }
         master ! WorkAccepted(index, ctx.self)
         val processed = stage.actions.foldLeft(data) { (acc, action) => action.applyUnsafe(acc) }
+        println(s"[WORKER] ${ctx.self.path.name} Finished partition $index")
         master ! WorkDone(index, processed, ctx.self)
         Behaviors.same
     }
@@ -121,6 +124,7 @@ object Master {
             if (!workerIsAvailable || !partitionIsWaiting) {
               state
             } else {
+              println(s"[MASTER] Dispatched partition $partitionIdx to ${worker.path.name}")
               worker ! WorkBatch(partitionIdx, partitions(partitionIdx), task.stage, context.self)
               timers.startTimerWithFixedDelay(
                 retryKey(partitionIdx),
@@ -151,6 +155,7 @@ object Master {
         def active(oldState: MasterState): Behavior[MasterMessage] =
           Behaviors.receiveMessage {
             case WorkAccepted(idx, worker) =>
+              println(s"[MASTER] Confirmation received: ${worker.path.name} processing partition $idx")
               val newState = oldState.partitionStates(idx) match {
                 case PartitionState.Dispatched(w, _, _) if w == worker =>
                   timers.cancel(retryKey(idx))
@@ -163,6 +168,7 @@ object Master {
 
               active(newState)
             case WorkDone(idx, res, worker) =>
+              println(s"[MASTER] Partition $idx completed successfully by ${worker.path.name}")
               val maybeNewState = oldState.partitionStates(idx) match {
                 case PartitionState.Processing(w, _) if w == worker =>
                   timers.cancel(retryKey(idx))
@@ -196,6 +202,7 @@ object Master {
                   active(oldState)
               }
             case WorkerDied(worker) =>
+              println(s"[MASTER] ERROR: ${worker.path.name} died! Re-evaluating assigned partitions...")
               val interruptedPartitions = oldState.partitionStates.zipWithIndex.collect {
                 case (PartitionState.Dispatched(w, _, _), i) if w == worker => i
                 case (Processing(w, _), i) if w == worker => i
