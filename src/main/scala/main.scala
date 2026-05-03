@@ -43,19 +43,24 @@ val rng = Random()
 object Worker {
   private val log: Logger = LoggerFactory.getLogger(Worker.getClass)
 
-  def apply(enableCrashForTest: Boolean): Behavior[WorkerMessage] = Behaviors.receive { (ctx, msg) =>
+  def apply(options: Options): Behavior[WorkerMessage] = Behaviors.receive { (ctx, msg) =>
     msg match {
       case WorkBatch(index, data, stage, master) =>
-        println(s"[WORKER] ${ctx.self.path.name} Received partition $index")
-        if (enableCrashForTest && rng.nextFloat() <= 0.02) {
-          println(s"[WORKER] ${ctx.self.path.name} CRASHING INTENTIONALLY !")
+        ctx.log.info(s"${ctx.self.path.name} Received partition $index")
+        if (options.autoCrash && rng.nextFloat() <= 0.01) {
+          ctx.log.info(s"${ctx.self.path.name} CRASHING INTENTIONALLY !")
           throw RuntimeException(s"test1: simulated crash on ${ctx.self.path.name}")
         }
-        master ! WorkAccepted(index, ctx.self)
-        val processed = stage.mapper(data)
-        println(s"[WORKER] ${ctx.self.path.name} Finished partition $index")
-        master ! WorkDone(index, processed, ctx.self)
-        Behaviors.same
+        if (options.autoMessageMiss && rng.nextFloat() < 0.001) {
+          ctx.log.info("INTENTIONALLY MISSING A MESSAGE!")
+          Behaviors.same
+        } else {
+          master ! WorkAccepted(index, ctx.self)
+          val processed = stage.mapper(data)
+          ctx.log.info(s"${ctx.self.path.name} Finished partition $index")
+          master ! WorkDone(index, processed, ctx.self)
+          Behaviors.same
+        }
     }
   }
 }
@@ -79,7 +84,7 @@ case class MasterState(partitionStates: Vector[PartitionState],
                        partitionsDone: Int)
 
 object Master {
-  def apply[I, O, F](task: Task[I, O, F], enableCrashForTest: Boolean): Behavior[MasterMessage] =
+  def apply[I, O, F](task: Task[I, O, F], options: Options): Behavior[MasterMessage] =
     Behaviors.setup { context =>
       Behaviors.withTimers { timers =>
         val partitions = task.data.grouped(1024).toVector
@@ -90,7 +95,7 @@ object Master {
         extension (state: MasterState) {
           def spawnWorker(): (MasterState, WorkerRef) = {
             val spawned = context.spawn(
-              Behaviors.supervise(Worker(enableCrashForTest)).onFailure(SupervisorStrategy.stop.withLoggingEnabled(true)),
+              Behaviors.supervise(Worker(options)).onFailure(SupervisorStrategy.stop.withLoggingEnabled(true)),
               s"worker-${state.nextWorkerNumber}",
               DispatcherSelector.fromConfig("cpu-dispatcher"))
             context.watchWith(spawned, WorkerDied(spawned))
@@ -142,12 +147,12 @@ object Master {
             if (!workerIsAvailable || !partitionIsWaiting) {
               state
             } else {
-              println(s"[MASTER] Dispatched partition $partitionIdx to ${worker.path.name}")
+              context.log.info(s"Dispatched partition $partitionIdx to ${worker.path.name}")
               worker ! WorkBatch(partitionIdx, partitions(partitionIdx), task.stage, context.self)
               timers.startTimerWithFixedDelay(
                 retryKey(partitionIdx),
                 RetrySendWork(partitionIdx),
-                5.seconds
+                500.millis
               )
 
               state.copy(
@@ -169,7 +174,7 @@ object Master {
         def active(oldState: MasterState): Behavior[MasterMessage] =
           Behaviors.receiveMessage {
             case WorkAccepted(idx, worker) =>
-              println(s"[MASTER] Confirmation received: ${worker.path.name} processing partition $idx")
+              context.log.info(s"Confirmation received: ${worker.path.name} processing partition $idx")
               val newState = oldState.partitionStates(idx) match {
                 case PartitionState.Dispatched(w, _, _) if w == worker =>
                   timers.cancel(retryKey(idx))
@@ -183,7 +188,7 @@ object Master {
 
               active(newState)
             case WorkDone(idx, res, worker) =>
-              println(s"[MASTER] Partition $idx completed successfully by ${worker.path.name} (${oldState.waitingPartitions.size} remaining)")
+              context.log.info(s"Partition $idx completed successfully by ${worker.path.name} (${oldState.waitingPartitions.size} remaining)")
               val maybeNewState = oldState.partitionStates(idx) match {
                 case PartitionState.Processing(w, _) if w == worker =>
                   timers.cancel(retryKey(idx))
@@ -210,9 +215,9 @@ object Master {
                   // All work done: Reconstitute in order
                   val allParts = newState.partitionStates.asInstanceOf[Vector[PartitionState.Done]]
                   val reassembledPartitions = allParts.flatMap(_.result).asInstanceOf[Vector[O]]
-                  println(s"--- All partitions have been received! ---")
+                  context.log.info(s"--- All partitions have been received! ---")
                   val finalData = task.stage.reducer(reassembledPartitions)
-                  println(finalData)
+                  context.log.info("Data: \n {}", finalData)
                   Behaviors.stopped
                 case Some(newState) =>
                   active(newState.sendNextWork(worker))
@@ -220,7 +225,7 @@ object Master {
                   active(oldState)
               }
             case WorkerDied(worker) =>
-              println(s"[MASTER] ERROR: ${worker.path.name} died! Re-evaluating assigned partitions...")
+              context.log.info(s"ERROR: ${worker.path.name} died! Re-evaluating assigned partitions...")
               val interruptedPartitions = oldState.partitionStates.zipWithIndex.collect {
                 case (PartitionState.Dispatched(w, _, _), i) if w == worker => i
                 case (Processing(w, _), i) if w == worker => i
@@ -273,10 +278,17 @@ object Master {
     }
 }
 
+case class Options(autoCrash: Boolean, autoMessageMiss: Boolean)
+
 @main
 def main(args: String*): Unit = {
   val mode = args.headOption.getOrElse("run")
   val enableCrashForTest = mode == "test1"
+
+  val options = Options(
+    args.contains("auto-crash"),
+    args.contains("auto-message-miss")
+  )
 
   val rawData = (1L to 100_000_000L).toVector // Example data
 
@@ -293,7 +305,7 @@ def main(args: String*): Unit = {
   }
 
   val system = ActorSystem(
-    Master(Task(rawData, Stage(map, reduce)), enableCrashForTest),
+    Master(Task(rawData, Stage(map, reduce)), options),
     "ProcessingSystem"
   )
 }
