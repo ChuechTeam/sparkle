@@ -1,11 +1,12 @@
-import PartitionState.Processing
+import PartitionState.*
+import WorkerState.{Assigned, Available}
+import org.apache.pekko.actor.typed.*
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
-import org.apache.pekko.actor.typed.{ActorRef, ActorSystem, Behavior, SupervisorStrategy}
+import org.slf4j.{Logger, LoggerFactory}
 
 import java.time.Instant
 import scala.concurrent.duration.DurationInt
 import scala.util.Random
-import scala.util.chaining.scalaUtilChainingOps
 
 // Marker trait for Kryo serialization
 //trait SerializableMessage
@@ -21,12 +22,14 @@ sealed trait WorkerMessage
  */
 sealed trait MasterMessage
 
-case class WorkBatch(index: Int, data: Vector[?], stage: Stage, master: MasterRef) extends WorkerMessage
+case class WorkBatch[T](index: Int, data: Vector[T], stage: Stage[T, ?, ?], master: MasterRef) extends WorkerMessage
 
 case class WorkAccepted(index: Int, worker: WorkerRef) extends MasterMessage
+
 case class WorkDone(index: Int, result: Vector[?], worker: WorkerRef) extends MasterMessage
 
 case class WorkerDied(worker: WorkerRef) extends MasterMessage
+
 case class RetrySendWork(index: Int) extends MasterMessage
 
 // not sure
@@ -38,16 +41,18 @@ type MasterRef = ActorRef[MasterMessage]
 val rng = Random()
 
 object Worker {
+  private val log: Logger = LoggerFactory.getLogger(Worker.getClass)
+
   def apply(enableCrashForTest: Boolean): Behavior[WorkerMessage] = Behaviors.receive { (ctx, msg) =>
     msg match {
       case WorkBatch(index, data, stage, master) =>
         println(s"[WORKER] ${ctx.self.path.name} Received partition $index")
-        if (enableCrashForTest && ctx.self.path.name == "worker-1") {
+        if (enableCrashForTest && rng.nextFloat() <= 0.02) {
           println(s"[WORKER] ${ctx.self.path.name} CRASHING INTENTIONALLY !")
           throw RuntimeException(s"test1: simulated crash on ${ctx.self.path.name}")
         }
         master ! WorkAccepted(index, ctx.self)
-        val processed = stage.actions.foldLeft(data) { (acc, action) => action.applyUnsafe(acc) }
+        val processed = stage.mapper(data)
         println(s"[WORKER] ${ctx.self.path.name} Finished partition $index")
         master ! WorkDone(index, processed, ctx.self)
         Behaviors.same
@@ -68,29 +73,30 @@ enum WorkerState {
 }
 
 case class MasterState(partitionStates: Vector[PartitionState],
-                       workers: Set[WorkerRef],
-                       workerStates: Map[WorkerRef, WorkerState],
+                       waitingPartitions: Set[Int],
+                       workers: Map[WorkerRef, WorkerState],
                        nextWorkerNumber: Int,
                        partitionsDone: Int)
 
 object Master {
-  def apply(task: Task, enableCrashForTest: Boolean): Behavior[MasterMessage] =
+  def apply[I, O, F](task: Task[I, O, F], enableCrashForTest: Boolean): Behavior[MasterMessage] =
     Behaviors.setup { context =>
       Behaviors.withTimers { timers =>
         val partitions = task.data.grouped(1024).toVector
         val maxAckRetries = 3
+
         def retryKey(partitionIdx: Int): String = s"retry-work-$partitionIdx"
 
         extension (state: MasterState) {
           def spawnWorker(): (MasterState, WorkerRef) = {
             val spawned = context.spawn(
               Behaviors.supervise(Worker(enableCrashForTest)).onFailure(SupervisorStrategy.stop.withLoggingEnabled(true)),
-              s"worker-${state.nextWorkerNumber}")
+              s"worker-${state.nextWorkerNumber}",
+              DispatcherSelector.fromConfig("cpu-dispatcher"))
             context.watchWith(spawned, WorkerDied(spawned))
 
             (state.copy(
-              workers = state.workers + spawned,
-              workerStates = state.workerStates + (spawned -> WorkerState.Available),
+              workers = state.workers + (spawned -> WorkerState.Available),
               nextWorkerNumber = state.nextWorkerNumber + 1
             ), spawned)
           }
@@ -100,14 +106,26 @@ object Master {
           }
 
           def sendNextWorkToAllWorkers(): MasterState = {
-            state.workers.foldLeft(state)((state, w) => state.sendNextWork(w))
+            state.workers.keys.foldLeft(state)((state, w) => state.sendNextWork(w))
           }
 
           def removeWorker(worker: WorkerRef): MasterState = {
-            state.copy(
-              workers = state.workers - worker,
-              workerStates = state.workerStates - worker
-            )
+            state.workers.get(worker) match {
+              case Some(workerState) =>
+                val newState = workerState match {
+                  case Assigned(partitionIdx) =>
+                    timers.cancel(retryKey(partitionIdx))
+                    state.copy(
+                      partitionStates = state.partitionStates.updated(partitionIdx, PartitionState.Waiting),
+                      waitingPartitions = state.waitingPartitions + partitionIdx
+                    )
+                  case Available => state
+                }
+                newState.copy(
+                  workers = state.workers - worker,
+                )
+              case None => state
+            }
           }
 
           def replaceWorker(worker: WorkerRef): (MasterState, WorkerRef) = {
@@ -118,7 +136,7 @@ object Master {
           }
 
           def sendWork(partitionIdx: Int, worker: WorkerRef): MasterState = {
-            val workerIsAvailable = state.workerStates.get(worker).contains(WorkerState.Available)
+            val workerIsAvailable = state.workers.get(worker).contains(WorkerState.Available)
             val partitionIsWaiting = state.partitionStates(partitionIdx) == PartitionState.Waiting
 
             if (!workerIsAvailable || !partitionIsWaiting) {
@@ -135,21 +153,17 @@ object Master {
               state.copy(
                 partitionStates = state.partitionStates.updated(partitionIdx,
                   PartitionState.Dispatched(worker, Instant.now(), retryCount = 0)),
-                workerStates = state.workerStates.updated(worker, WorkerState.Assigned(partitionIdx))
+                waitingPartitions = state.waitingPartitions - partitionIdx,
+                workers = state.workers.updated(worker, WorkerState.Assigned(partitionIdx))
               )
             }
           }
 
-          def sendNextWork(worker: WorkerRef): MasterState = {
-            val nextWaitingPartitionIdx = state.partitionStates.indexWhere(_ == PartitionState.Waiting)
-            if (nextWaitingPartitionIdx == -1) {
-              state
+          def sendNextWork(worker: WorkerRef): MasterState =
+            state.waitingPartitions.headOption match {
+              case Some(waitingIdx) => state.sendWork(waitingIdx, worker)
+              case None => state
             }
-            else {
-              state.sendWork(nextWaitingPartitionIdx, worker)
-            }
-          }
-
         }
 
         def active(oldState: MasterState): Behavior[MasterMessage] =
@@ -161,27 +175,30 @@ object Master {
                   timers.cancel(retryKey(idx))
                   oldState.copy(
                     partitionStates = oldState.partitionStates.updated(idx, Processing(worker, Instant.now())),
-                    workerStates = oldState.workerStates.updated(worker, WorkerState.Assigned(idx))
+                    waitingPartitions = oldState.waitingPartitions - idx,
+                    workers = oldState.workers.updated(worker, WorkerState.Assigned(idx))
                   )
                 case _ => oldState
               }
 
               active(newState)
             case WorkDone(idx, res, worker) =>
-              println(s"[MASTER] Partition $idx completed successfully by ${worker.path.name}")
+              println(s"[MASTER] Partition $idx completed successfully by ${worker.path.name} (${oldState.waitingPartitions.size} remaining)")
               val maybeNewState = oldState.partitionStates(idx) match {
                 case PartitionState.Processing(w, _) if w == worker =>
                   timers.cancel(retryKey(idx))
                   Some(oldState.copy(
                     partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
-                    workerStates = oldState.workerStates.updated(worker, WorkerState.Available),
+                    waitingPartitions = oldState.waitingPartitions - idx,
+                    workers = oldState.workers.updated(worker, WorkerState.Available),
                     partitionsDone = oldState.partitionsDone + 1
                   ))
                 case PartitionState.Dispatched(w, _, _) if w == worker =>
                   timers.cancel(retryKey(idx))
                   Some(oldState.copy(
                     partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
-                    workerStates = oldState.workerStates.updated(worker, WorkerState.Available),
+                    waitingPartitions = oldState.waitingPartitions - idx,
+                    workers = oldState.workers.updated(worker, WorkerState.Available),
                     partitionsDone = oldState.partitionsDone + 1
                   ))
                 case _ =>
@@ -192,9 +209,10 @@ object Master {
                 case Some(newState) if newState.partitionsDone == partitions.size =>
                   // All work done: Reconstitute in order
                   val allParts = newState.partitionStates.asInstanceOf[Vector[PartitionState.Done]]
-                  val finalData = allParts.flatMap(_.result)
-                  println(s"--- Processing Complete ---")
-                  finalData.foreach(println)
+                  val reassembledPartitions = allParts.flatMap(_.result).asInstanceOf[Vector[O]]
+                  println(s"--- All partitions have been received! ---")
+                  val finalData = task.stage.reducer(reassembledPartitions)
+                  println(finalData)
                   Behaviors.stopped
                 case Some(newState) =>
                   active(newState.sendNextWork(worker))
@@ -211,20 +229,7 @@ object Master {
               if (!oldState.workers.contains(worker)) {
                 active(oldState)
               } else {
-                interruptedPartitions.foreach(idx => timers.cancel(retryKey(idx)))
-                val requeuedState = oldState.copy(
-                  partitionStates = oldState.partitionStates.zipWithIndex.map {
-                    case (PartitionState.Dispatched(w, _, _), i) if w == worker && interruptedPartitions.contains(i) =>
-                      PartitionState.Waiting
-                    case (PartitionState.Processing(w, _), i) if w == worker && interruptedPartitions.contains(i) =>
-                      PartitionState.Waiting
-                    case (partitionState, _) =>
-                      partitionState
-                  }
-                )
-                val (stateWithReplacement, _) = requeuedState.replaceWorker(worker)
-
-                active(stateWithReplacement.sendNextWorkToAllWorkers())
+                active(oldState.replaceWorker(worker)._1.sendNextWorkToAllWorkers())
               }
             case RetrySendWork(idx) =>
               val newState = oldState.partitionStates(idx) match {
@@ -240,23 +245,12 @@ object Master {
                       )
                     )
                   } else {
-                    val workerPartitions = oldState.partitionStates.zipWithIndex.collect {
-                      case (PartitionState.Dispatched(w, _, _), i) if w == worker => i
-                      case (Processing(w, _), i) if w == worker => i
-                    }
-                    workerPartitions.foreach(i => timers.cancel(retryKey(i)))
-                    val requeuedState = oldState.copy(
-                      partitionStates = oldState.partitionStates.zipWithIndex.map {
-                        case (PartitionState.Dispatched(w, _, _), i) if w == worker && workerPartitions.contains(i) =>
-                          PartitionState.Waiting
-                        case (PartitionState.Processing(w, _), i) if w == worker && workerPartitions.contains(i) =>
-                          PartitionState.Waiting
-                        case (partitionState, _) =>
-                          partitionState
-                      }
-                    )
-                    val (stateWithReplacement, _) = requeuedState.replaceWorker(worker)
-                    stateWithReplacement.sendNextWorkToAllWorkers()
+                    timers.cancel(retryKey(idx))
+                    val (newState, _) = oldState.copy(
+                      partitionStates = oldState.partitionStates.updated(idx, Waiting),
+                      waitingPartitions = oldState.waitingPartitions + idx
+                    ).replaceWorker(worker)
+                    newState.sendNextWorkToAllWorkers()
                   }
                 case _ =>
                   oldState
@@ -266,8 +260,8 @@ object Master {
 
         val state = MasterState(
           partitionStates = partitions.map(_ => PartitionState.Waiting),
-          workers = Set.empty,
-          workerStates = Map.empty,
+          waitingPartitions = partitions.indices.toSet,
+          workers = Map.empty,
           nextWorkerNumber = 1,
           partitionsDone = 0
         )
@@ -284,14 +278,22 @@ def main(args: String*): Unit = {
   val mode = args.headOption.getOrElse("run")
   val enableCrashForTest = mode == "test1"
 
-  val rawData = (1 to 50000).toVector // Example data
-  val actions = List(
-    FilterAction[Int](_ < 100), // Logic: Keep numbers < 100
-    MapAction[Int, String](x => "Nombre : " + x) // map stuff
-  )
+  val rawData = (1L to 100_000_000L).toVector // Example data
+
+  def map(vector: Vector[Long]): Vector[(Long, Int)] = {
+    vector
+      .map(x => x * x)
+      .groupBy(_ % 10)
+      .map((k, v) => (k, v.size))
+      .toVector
+  }
+
+  def reduce(vector: Vector[(Long, Int)]): Map[Long, Int] = {
+    vector.groupMapReduce(_._1)(_._2)(_ + _)
+  }
 
   val system = ActorSystem(
-    Master(Task(rawData, Stage(actions, Option.empty)), enableCrashForTest),
+    Master(Task(rawData, Stage(map, reduce)), enableCrashForTest),
     "ProcessingSystem"
   )
 }
