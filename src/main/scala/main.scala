@@ -5,6 +5,8 @@ import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.time.Instant
+import scala.concurrent.Await
+import scala.concurrent.duration.Duration
 import scala.concurrent.duration.DurationInt
 import scala.util.Random
 
@@ -47,11 +49,11 @@ object Worker {
     msg match {
       case WorkBatch(index, data, stage, master) =>
         ctx.log.info(s"${ctx.self.path.name} Received partition $index")
-        if (options.autoCrash && rng.nextFloat() <= 0.01) {
+        if (options.autoCrash && rng.nextFloat() <= 0.5) {
           ctx.log.info(s"${ctx.self.path.name} CRASHING INTENTIONALLY !")
           throw RuntimeException(s"[SIMULATED] - Crash on ${ctx.self.path.name}")
         }
-        if (options.autoMessageMiss && rng.nextFloat() < 0.001) {
+        if (options.autoMessageMiss && rng.nextFloat() < 0.5) {
           ctx.log.info("INTENTIONALLY MISSING A MESSAGE!")
           Behaviors.same
         } else {
@@ -120,6 +122,9 @@ object Master {
                 val newState = workerState match {
                   case Assigned(partitionIdx) =>
                     timers.cancel(retryKey(partitionIdx))
+                    context.log.info(
+                      s"[REQUEUE] partition $partitionIdx (worker ${worker.path.name} removed while Assigned)"
+                    )
                     state.copy(
                       partitionStates = state.partitionStates.updated(partitionIdx, PartitionState.Waiting),
                       waitingPartitions = state.waitingPartitions + partitionIdx
@@ -242,6 +247,9 @@ object Master {
                   val nextRetryCount = retryCount + 1
 
                   if (nextRetryCount <= maxAckRetries) {
+                    context.log.info(
+                      s"[RETRY-ACK] attempt $nextRetryCount/$maxAckRetries: partition $idx still Dispatched, resending WorkBatch to ${worker.path.name}"
+                    )
                     worker ! WorkBatch(idx, partitions(idx), task.stage, context.self)
                     oldState.copy(
                       partitionStates = oldState.partitionStates.updated(
@@ -251,6 +259,9 @@ object Master {
                     )
                   } else {
                     timers.cancel(retryKey(idx))
+                    context.log.info(
+                      s"[RETRY-ACK-EXHAUSTED] partition $idx on ${worker.path.name}: re-queue, replace worker, redispatch to available workers"
+                    )
                     val (newState, _) = oldState.copy(
                       partitionStates = oldState.partitionStates.updated(idx, Waiting),
                       waitingPartitions = oldState.waitingPartitions + idx
@@ -305,4 +316,6 @@ def main(args: String*): Unit = {
     Master(Task(rawData, Stage(map, reduce)), options),
     "ProcessingSystem"
   )
+
+  Await.ready(system.whenTerminated, Duration.Inf)
 }
