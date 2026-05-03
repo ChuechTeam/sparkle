@@ -6,6 +6,7 @@ import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.time.Instant
+import java.util.concurrent.ConcurrentHashMap
 import scala.concurrent.Await
 import scala.concurrent.duration.{Duration, DurationInt}
 import scala.util.Random
@@ -44,6 +45,23 @@ type MasterRef = ActorRef[MasterMessage]
 
 val rng = Random()
 
+class FaultState {
+  private val ackExhaustReceiveCounts = ConcurrentHashMap[Int, Int]()
+  private val crashedAfterAckPartitions = ConcurrentHashMap.newKeySet[Int]()
+  private val missedWorkDonePartitions = ConcurrentHashMap.newKeySet[Int]()
+
+  def shouldMissAckUntilExhaustion(partitionIdx: Int, maxReceivesBeforeExhaustion: Int): Boolean = {
+    val receiveCount = ackExhaustReceiveCounts.merge(partitionIdx, 1, Integer.sum)
+    receiveCount <= maxReceivesBeforeExhaustion
+  }
+
+  def shouldCrashAfterAck(partitionIdx: Int): Boolean =
+    crashedAfterAckPartitions.add(partitionIdx)
+
+  def shouldMissWorkDone(partitionIdx: Int): Boolean =
+    missedWorkDonePartitions.add(partitionIdx)
+}
+
 object Worker {
   private val log: Logger = LoggerFactory.getLogger(Worker.getClass)
 
@@ -61,8 +79,15 @@ object Worker {
           if (options.autoMessageMiss && rng.nextFloat() < 0.5) {
             ctx.log.warn("INTENTIONALLY MISSING A MESSAGE!")
             Behaviors.same
+          } else if (options.autoAckExhaust && index == 0 && options.faultState.shouldMissAckUntilExhaustion(index, 4)) {
+            ctx.log.warn(s"[SIMULATED-ACK-EXHAUST] ${ctx.self.path.name} intentionally stays silent for partition $index")
+            Behaviors.same
           } else {
             master ! WorkAccepted(index, ctx.self)
+            if (options.autoCrashAfterAck && index == 1 && options.faultState.shouldCrashAfterAck(index)) {
+              ctx.log.warn(s"${ctx.self.path.name} CRASHING INTENTIONALLY AFTER ACK !")
+              throw RuntimeException(s"[SIMULATED] - Crash after ACK on ${ctx.self.path.name}")
+            }
             val processed = stage.mapper(data)
             ctx.log.debug(s"${ctx.self.path.name} Finished partition $index")
             pendingWorkDone = Some((index, processed, master))
@@ -78,7 +103,7 @@ object Worker {
         case RetryWorkDone(index) =>
           pendingWorkDone match {
             case Some((idx, result, master)) if idx == index =>
-              ctx.log.debug(s"${ctx.self.path.name} Retrying WorkDone for partition $index")
+              ctx.log.info(s"[RETRY-WORK-DONE] ${ctx.self.path.name} resends result for partition $index")
               master ! WorkDone(index, result, ctx.self)
               Behaviors.same
             case _ => Behaviors.same
@@ -209,47 +234,73 @@ object Master {
                     waitingPartitions = oldState.waitingPartitions - idx,
                     workers = oldState.workers.updated(worker, WorkerState.Assigned(idx))
                   )
-                case _ => oldState
+                case currentState =>
+                  context.log.info(
+                    s"[IGNORED-ACK] partition $idx from ${worker.path.name} ignored because current state is $currentState"
+                  )
+                  oldState
               }
 
               active(newState)
             case WorkDone(idx, res, worker) =>
-              context.log.info(s"Partition $idx completed successfully by ${worker.path.name} (${oldState.waitingPartitions.size} remaining)")
-              worker ! WorkDoneAcknowledged(idx)
-              val maybeNewState = oldState.partitionStates(idx) match {
-                case PartitionState.Processing(w, _) if w == worker =>
-                  timers.cancel(retryKey(idx))
-                  Some(oldState.copy(
-                    partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
-                    waitingPartitions = oldState.waitingPartitions - idx,
-                    workers = oldState.workers.updated(worker, WorkerState.Available),
-                    partitionsDone = oldState.partitionsDone + 1
-                  ))
-                case PartitionState.Dispatched(w, _, _) if w == worker =>
-                  timers.cancel(retryKey(idx))
-                  Some(oldState.copy(
-                    partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
-                    waitingPartitions = oldState.waitingPartitions - idx,
-                    workers = oldState.workers.updated(worker, WorkerState.Available),
-                    partitionsDone = oldState.partitionsDone + 1
-                  ))
-                case _ =>
-                  None
-              }
+              if (options.autoWorkDoneMiss && idx == 2 && options.faultState.shouldMissWorkDone(idx)) {
+                context.log.warn(
+                  s"[SIMULATED-WORKDONE-MISS] master intentionally ignores first WorkDone for partition $idx from ${worker.path.name}"
+                )
+                active(oldState)
+              } else {
+                def acknowledgeWorkDone(): Unit = {
+                  worker ! WorkDoneAcknowledged(idx)
+                }
 
-              maybeNewState match {
-                case Some(newState) if newState.partitionsDone == partitions.size =>
-                  // All work done: Reconstitute in order
-                  val allParts = newState.partitionStates.asInstanceOf[Vector[PartitionState.Done]]
-                  val reassembledPartitions = allParts.flatMap(_.result).asInstanceOf[Vector[O]]
-                  context.log.info(s"--- All partitions have been received! ---")
-                  val finalData = task.stage.reducer(reassembledPartitions)
-                  context.log.info("Data: \n {}", finalData)
-                  Behaviors.stopped
-                case Some(newState) =>
-                  active(newState.sendNextWork(worker))
-                case None =>
-                  active(oldState)
+                val maybeNewState = oldState.partitionStates(idx) match {
+                  case PartitionState.Processing(w, _) if w == worker =>
+                    timers.cancel(retryKey(idx))
+                    context.log.info(s"Partition $idx completed successfully by ${worker.path.name} (${oldState.waitingPartitions.size} remaining)")
+                    acknowledgeWorkDone()
+                    Some(oldState.copy(
+                      partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
+                      waitingPartitions = oldState.waitingPartitions - idx,
+                      workers = oldState.workers.updated(worker, WorkerState.Available),
+                      partitionsDone = oldState.partitionsDone + 1
+                    ))
+                  case PartitionState.Dispatched(w, _, _) if w == worker =>
+                    timers.cancel(retryKey(idx))
+                    context.log.info(s"Partition $idx completed successfully by ${worker.path.name} (${oldState.waitingPartitions.size} remaining)")
+                    acknowledgeWorkDone()
+                    Some(oldState.copy(
+                      partitionStates = oldState.partitionStates.updated(idx, PartitionState.Done(res)),
+                      waitingPartitions = oldState.waitingPartitions - idx,
+                      workers = oldState.workers.updated(worker, WorkerState.Available),
+                      partitionsDone = oldState.partitionsDone + 1
+                    ))
+                  case PartitionState.Done(_) =>
+                    context.log.info(
+                      s"[IGNORED-DONE] partition $idx from ${worker.path.name} ignored because it is already Done"
+                    )
+                    acknowledgeWorkDone()
+                    None
+                  case currentState =>
+                    context.log.info(
+                      s"[IGNORED-DONE] partition $idx from ${worker.path.name} ignored because current state is $currentState"
+                    )
+                    None
+                }
+
+                maybeNewState match {
+                  case Some(newState) if newState.partitionsDone == partitions.size =>
+                    // All work done: Reconstitute in order
+                    val allParts = newState.partitionStates.asInstanceOf[Vector[PartitionState.Done]]
+                    val reassembledPartitions = allParts.flatMap(_.result).asInstanceOf[Vector[O]]
+                    context.log.info(s"--- All partitions have been received! ---")
+                    val finalData = task.stage.reducer(reassembledPartitions)
+                    context.log.info("Data: \n {}", finalData)
+                    Behaviors.stopped
+                  case Some(newState) =>
+                    active(newState.sendNextWork(worker))
+                  case None =>
+                    active(oldState)
+                }
               }
             case WorkerDied(worker) =>
               context.log.warn(s"ERROR: ${worker.path.name} died! Re-evaluating assigned partitions...")
@@ -311,14 +362,26 @@ object Master {
     }
 }
 
-case class Options(autoCrash: Boolean, autoMessageMiss: Boolean, quiet: Boolean)
+case class Options(
+                    autoCrash: Boolean,
+                    autoMessageMiss: Boolean,
+                    quiet: Boolean,
+                    autoCrashAfterAck: Boolean,
+                    autoAckExhaust: Boolean,
+                    autoWorkDoneMiss: Boolean,
+                    faultState: FaultState
+                  )
 
 @main
 def main(args: String*): Unit = {
   val options = Options(
     args.contains("auto-crash"),
     args.contains("auto-message-miss"),
-    args.contains("quiet")
+    args.contains("auto-crash-after-ack"),
+    args.contains("auto-ack-exhaust"),
+    args.contains("auto-workdone-miss"),
+    args.contains("quiet"),
+    FaultState()
   )
 
   // configure logging to be more or less chatty
