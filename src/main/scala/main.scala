@@ -49,7 +49,7 @@ object Worker {
         ctx.log.info(s"${ctx.self.path.name} Received partition $index")
         if (options.autoCrash && rng.nextFloat() <= 0.01) {
           ctx.log.info(s"${ctx.self.path.name} CRASHING INTENTIONALLY !")
-          throw RuntimeException(s"test1: simulated crash on ${ctx.self.path.name}")
+          throw RuntimeException(s"[SIMULATED] - Crash on ${ctx.self.path.name}")
         }
         if (options.autoMessageMiss && rng.nextFloat() < 0.001) {
           ctx.log.info("INTENTIONALLY MISSING A MESSAGE!")
@@ -282,9 +282,6 @@ case class Options(autoCrash: Boolean, autoMessageMiss: Boolean)
 
 @main
 def main(args: String*): Unit = {
-  val mode = args.headOption.getOrElse("run")
-  val enableCrashForTest = mode == "test1"
-
   val options = Options(
     args.contains("auto-crash"),
     args.contains("auto-message-miss")
