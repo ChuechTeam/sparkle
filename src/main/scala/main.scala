@@ -1,18 +1,19 @@
 import PartitionState.*
 import WorkerState.{Assigned, Available}
+import ch.qos.logback.classic.{Level, LoggerContext}
 import org.apache.pekko.actor.typed.*
 import org.apache.pekko.actor.typed.scaladsl.Behaviors
 import org.slf4j.{Logger, LoggerFactory}
 
 import java.time.Instant
 import scala.concurrent.Await
-import scala.concurrent.duration.Duration
-import scala.concurrent.duration.DurationInt
+import scala.concurrent.duration.{Duration, DurationInt}
 import scala.util.Random
 
-// Marker trait for Kryo serialization
-//trait SerializableMessage
+case class Task[I, O, F](data: Vector[I], stage: Stage[I, O, F])
 
+// Accidentally made map reduce
+case class Stage[I, O, F](mapper: Vector[I] => Vector[O], reducer: Vector[O] => F)
 
 /**
  * A message that a worker can receive.
@@ -30,12 +31,13 @@ case class WorkAccepted(index: Int, worker: WorkerRef) extends MasterMessage
 
 case class WorkDone(index: Int, result: Vector[?], worker: WorkerRef) extends MasterMessage
 
+case class WorkDoneAcknowledged(index: Int) extends WorkerMessage
+
 case class WorkerDied(worker: WorkerRef) extends MasterMessage
 
 case class RetrySendWork(index: Int) extends MasterMessage
 
-// not sure
-//case class WorkFailed(errorMessage: String, worker: ActorRef[WorkBatch[?]])
+case class RetryWorkDone(index: Int) extends WorkerMessage
 
 type WorkerRef = ActorRef[WorkerMessage]
 type MasterRef = ActorRef[MasterMessage]
@@ -45,24 +47,43 @@ val rng = Random()
 object Worker {
   private val log: Logger = LoggerFactory.getLogger(Worker.getClass)
 
-  def apply(options: Options): Behavior[WorkerMessage] = Behaviors.receive { (ctx, msg) =>
-    msg match {
-      case WorkBatch(index, data, stage, master) =>
-        ctx.log.info(s"${ctx.self.path.name} Received partition $index")
-        if (options.autoCrash && rng.nextFloat() <= 0.5) {
-          ctx.log.info(s"${ctx.self.path.name} CRASHING INTENTIONALLY !")
-          throw RuntimeException(s"[SIMULATED] - Crash on ${ctx.self.path.name}")
-        }
-        if (options.autoMessageMiss && rng.nextFloat() < 0.5) {
-          ctx.log.info("INTENTIONALLY MISSING A MESSAGE!")
+  def apply(options: Options): Behavior[WorkerMessage] = Behaviors.withTimers { timers =>
+    var pendingWorkDone: Option[(Int, Vector[?], MasterRef)] = None
+
+    Behaviors.receive { (ctx, msg) =>
+      msg match {
+        case WorkBatch(index, data, stage, master) =>
+          ctx.log.debug(s"${ctx.self.path.name} Received partition $index")
+          if (options.autoCrash && rng.nextFloat() <= 0.5) {
+            ctx.log.warn(s"${ctx.self.path.name} CRASHING INTENTIONALLY !")
+            throw RuntimeException(s"[SIMULATED] - Crash on ${ctx.self.path.name}")
+          }
+          if (options.autoMessageMiss && rng.nextFloat() < 0.5) {
+            ctx.log.warn("INTENTIONALLY MISSING A MESSAGE!")
+            Behaviors.same
+          } else {
+            master ! WorkAccepted(index, ctx.self)
+            val processed = stage.mapper(data)
+            ctx.log.debug(s"${ctx.self.path.name} Finished partition $index")
+            pendingWorkDone = Some((index, processed, master))
+            master ! WorkDone(index, processed, ctx.self)
+            timers.startTimerWithFixedDelay(s"retry-work-done-$index", RetryWorkDone(index), 1.second)
+            Behaviors.same
+          }
+        case WorkDoneAcknowledged(index) =>
+          ctx.log.debug(s"${ctx.self.path.name} WorkDone for partition $index acknowledged")
+          timers.cancel(s"retry-work-done-$index")
+          pendingWorkDone = None
           Behaviors.same
-        } else {
-          master ! WorkAccepted(index, ctx.self)
-          val processed = stage.mapper(data)
-          ctx.log.info(s"${ctx.self.path.name} Finished partition $index")
-          master ! WorkDone(index, processed, ctx.self)
-          Behaviors.same
-        }
+        case RetryWorkDone(index) =>
+          pendingWorkDone match {
+            case Some((idx, result, master)) if idx == index =>
+              ctx.log.debug(s"${ctx.self.path.name} Retrying WorkDone for partition $index")
+              master ! WorkDone(index, result, ctx.self)
+              Behaviors.same
+            case _ => Behaviors.same
+          }
+      }
     }
   }
 }
@@ -152,7 +173,7 @@ object Master {
             if (!workerIsAvailable || !partitionIsWaiting) {
               state
             } else {
-              context.log.info(s"Dispatched partition $partitionIdx to ${worker.path.name}")
+              context.log.debug(s"Dispatched partition $partitionIdx to ${worker.path.name}")
               worker ! WorkBatch(partitionIdx, partitions(partitionIdx), task.stage, context.self)
               timers.startTimerWithFixedDelay(
                 retryKey(partitionIdx),
@@ -179,7 +200,7 @@ object Master {
         def active(oldState: MasterState): Behavior[MasterMessage] =
           Behaviors.receiveMessage {
             case WorkAccepted(idx, worker) =>
-              context.log.info(s"Confirmation received: ${worker.path.name} processing partition $idx")
+              context.log.debug(s"Confirmation received: ${worker.path.name} processing partition $idx")
               val newState = oldState.partitionStates(idx) match {
                 case PartitionState.Dispatched(w, _, _) if w == worker =>
                   timers.cancel(retryKey(idx))
@@ -194,6 +215,7 @@ object Master {
               active(newState)
             case WorkDone(idx, res, worker) =>
               context.log.info(s"Partition $idx completed successfully by ${worker.path.name} (${oldState.waitingPartitions.size} remaining)")
+              worker ! WorkDoneAcknowledged(idx)
               val maybeNewState = oldState.partitionStates(idx) match {
                 case PartitionState.Processing(w, _) if w == worker =>
                   timers.cancel(retryKey(idx))
@@ -230,7 +252,7 @@ object Master {
                   active(oldState)
               }
             case WorkerDied(worker) =>
-              context.log.info(s"ERROR: ${worker.path.name} died! Re-evaluating assigned partitions...")
+              context.log.warn(s"ERROR: ${worker.path.name} died! Re-evaluating assigned partitions...")
               val interruptedPartitions = oldState.partitionStates.zipWithIndex.collect {
                 case (PartitionState.Dispatched(w, _, _), i) if w == worker => i
                 case (Processing(w, _), i) if w == worker => i
@@ -289,14 +311,27 @@ object Master {
     }
 }
 
-case class Options(autoCrash: Boolean, autoMessageMiss: Boolean)
+case class Options(autoCrash: Boolean, autoMessageMiss: Boolean, quiet: Boolean)
 
 @main
 def main(args: String*): Unit = {
   val options = Options(
     args.contains("auto-crash"),
-    args.contains("auto-message-miss")
+    args.contains("auto-message-miss"),
+    args.contains("quiet")
   )
+
+  // configure logging to be more or less chatty
+  val loggerContext = LoggerFactory.getILoggerFactory.asInstanceOf[LoggerContext]
+  val pekkoLogger = loggerContext.getLogger("org.apache")
+  pekkoLogger.setLevel(Level.INFO)
+
+  val rootLogger = loggerContext.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME)
+  rootLogger.setLevel(if (options.quiet) {
+    Level.INFO
+  } else {
+    Level.DEBUG
+  })
 
   val rawData = (1L to 100_000_000L).toVector // Example data
 
@@ -317,5 +352,5 @@ def main(args: String*): Unit = {
     "ProcessingSystem"
   )
 
-  Await.ready(system.whenTerminated, Duration.Inf)
+  Await.result(system.whenTerminated, Duration.Inf)
 }
